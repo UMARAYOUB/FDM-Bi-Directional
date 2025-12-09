@@ -1,26 +1,44 @@
 import streamlit as st
 import pickle
-from tensorflow.keras.models import load_model
 import pandas as pd
 import numpy as np
 import time
+import tflite_runtime.interpreter as tflite
 
-# ---- Safe model load (fixes "NoneType.pop" error) ----
-model = load_model('ann_model.keras', compile=False)
-model.compile(optimizer='rmsprop', loss='mse')
+# ============================
+# LOAD TFLITE MODEL
+# ============================
 
-preprocessor = pickle.load(open('preprocessor.pkl', 'rb'))
+interpreter = tflite.Interpreter(model_path="model.tflite")
+interpreter.allocate_tensors()
 
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+# Prediction function
+def tflite_predict(input_array):
+    interpreter.set_tensor(input_details[0]["index"], input_array.astype(np.float32))
+    interpreter.invoke()
+    return interpreter.get_tensor(output_details[0]["index"])
+
+
+# Load preprocessor
+preprocessor = pickle.load(open("preprocessor.pkl", "rb"))
+
+# ============================
+#   STREAMLIT UI
+# ============================
 st.title("🔁 Bi-Directional FDM Property Predictor — PSO Optimizer")
 
 mode = st.radio("Select Mode:", ["Prediction Mode", "Optimization Mode"])
 
 # =====================================================================
-# ======================= PREDICTION MODE =============================
+# ======================= PREDICTION MODE ==============================
 # =====================================================================
 
 if mode == "Prediction Mode":
     st.subheader("Input Process Parameters")
+
     material = st.selectbox("Material", ["PLA", "ABS"])
     layer_height = st.number_input("Layer Height (mm)", min_value=0.05, max_value=1.0, value=0.2, step=0.01)
     wall_thickness = st.number_input("Wall Thickness (mm)", min_value=0.4, max_value=3.0, value=1.2, step=0.01)
@@ -33,6 +51,7 @@ if mode == "Prediction Mode":
     roughness = st.number_input("Roughness (µm)", min_value=0.0, max_value=1.0, value=0.2, step=0.001)
 
     if st.button("🔮 Predict Properties"):
+
         input_df = pd.DataFrame([{
             'material': material,
             'layer_height': layer_height,
@@ -45,8 +64,11 @@ if mode == "Prediction Mode":
             'fan_speed': fan_speed,
             'roughness': roughness
         }])
+
         input_data = preprocessor.transform(input_df)
-        preds = model.predict(input_data)
+
+        preds = tflite_predict(input_data)
+
         st.success(f"Tensile Strength: {preds[0][0]:.3f} MPa")
         st.success(f"Elongation: {preds[0][1]:.3f} %")
 
@@ -58,13 +80,10 @@ if mode == "Prediction Mode":
 else:
     st.subheader("Input Target Properties")
 
-    # 🌟 Only two main inputs visible to the user
     tensile_target = st.number_input("🎯 Target Tensile Strength (MPa)", min_value=0.0, max_value=200.0, value=30.0, step=0.1)
     elongation_target = st.number_input("🎯 Target Elongation (%)", min_value=0.0, max_value=200.0, value=5.0, step=0.1)
 
-    # =================================================================
-    # ▾ Collapsible PSO advanced settings (hidden by default)
-    # =================================================================
+    # ---- Advanced PSO Options ----
     with st.expander("⚙️ Advanced PSO Options (Optional)"):
         n_particles = st.slider("PSO Particles", 8, 200, 30)
         n_iter = st.slider("PSO Iterations", 10, 1000, 200)
@@ -73,7 +92,7 @@ else:
         social = st.number_input("Social (c2)", 0.0, 2.5, 1.5)
         early_stop_tol = st.number_input("Stop if MSE < ", min_value=0.0, value=1e-5, step=1e-6, format="%.8f")
 
-    # Default settings if user doesn't open the expander
+    # Defaults (if expander not touched)
     if "n_particles" not in locals():
         n_particles = 30
         n_iter = 200
@@ -82,31 +101,26 @@ else:
         social = 1.5
         early_stop_tol = 1e-5
 
-    # ================================================================
-    # ==================== RUN PSO OPTIMIZATION ======================
-    # ================================================================
-
     if st.button("🚀 Optimize Using PSO"):
         st.info("Running PSO Optimization...")
         progress_bar = st.progress(0)
         status = st.empty()
 
-        # Bounds for parameters
         bounds = np.array([
-            [0.05, 1.0],    # layer_height
-            [0.4, 3.0],     # wall_thickness
-            [0.0, 100.0],   # infill_density
-            [180.0, 250.0], # nozzle_temperature
-            [20.0, 120.0],  # bed_temperature
-            [10.0, 120.0],  # print_speed
-            [0.0, 100.0],   # fan_speed
-            [0.0, 1.0]      # roughness
+            [0.05, 1.0],
+            [0.4, 3.0],
+            [0.0, 100.0],
+            [180.0, 250.0],
+            [20.0, 120.0],
+            [10.0, 120.0],
+            [0.0, 100.0],
+            [0.0, 1.0]
         ])
 
         dim = bounds.shape[0]
         rng = np.random.default_rng(int(time.time()))
 
-        X = rng.uniform(bounds[:,0], bounds[:,1], size=(n_particles, dim))
+        X = rng.uniform(bounds[:, 0], bounds[:, 1], size=(n_particles, dim))
         V = rng.normal(0, 0.1, size=(n_particles, dim))
 
         pbest = X.copy()
@@ -115,11 +129,12 @@ else:
         gbest_score = np.inf
         gbest_pred = None
 
-        # Evaluate a batch for MSE
+        # Evaluate batch
         def evaluate_batch(X_batch):
-            df_rows = []
+
+            rows = []
             for xi in X_batch:
-                df_rows.append({
+                rows.append({
                     'material': 'PLA',
                     'layer_height': xi[0],
                     'wall_thickness': xi[1],
@@ -131,31 +146,34 @@ else:
                     'fan_speed': xi[6],
                     'roughness': xi[7]
                 })
-            df = pd.DataFrame(df_rows)
-            input_data = preprocessor.transform(df)
-            preds = model.predict(input_data, verbose=0)
+
+            df = pd.DataFrame(rows)
+            inp = preprocessor.transform(df)
+            preds = tflite_predict(inp)
+
             target = np.array([tensile_target, elongation_target])
-            scores = np.sum((preds - target)**2, axis=1)
+            scores = np.sum((preds - target) ** 2, axis=1)
+
             return preds, scores
 
-        # Initial evaluation
+        # Initial
         _, scores = evaluate_batch(X)
         pbest_scores = scores.copy()
-        pbest = X.copy()
 
         idx = np.argmin(scores)
         gbest = X[idx].copy()
         gbest_score = scores[idx]
         gbest_pred, _ = evaluate_batch(np.array([gbest]))
 
-        # PSO main loop
+        # PSO Loop
         for it in range(n_iter):
+
             r1 = rng.random((n_particles, dim))
             r2 = rng.random((n_particles, dim))
 
-            V = inertia*V + cognitive*r1*(pbest - X) + social*r2*(gbest - X)
+            V = inertia * V + cognitive * r1 * (pbest - X) + social * r2 * (gbest - X)
             X = X + V
-            X = np.clip(X, bounds[:,0], bounds[:,1])
+            X = np.clip(X, bounds[:, 0], bounds[:, 1])
 
             preds, scores = evaluate_batch(X)
 
@@ -175,7 +193,6 @@ else:
             if gbest_score < early_stop_tol:
                 break
 
-        # Show results
         best_params = {
             "Material": "PLA",
             "Layer Height": round(float(gbest[0]), 3),
@@ -186,7 +203,7 @@ else:
             "Bed Temperature": round(float(gbest[4]), 1),
             "Print Speed": round(float(gbest[5]), 1),
             "Fan Speed": round(float(gbest[6]), 1),
-            "Roughness": round(float(gbest[7]), 3)
+            "Roughness": round(float(gbest[7]), 3),
         }
 
         st.success("Optimization Complete!")
