@@ -5,4 +5,4 @@ pandas
 scikit-learn
 h5py
 Pillow
-
+protobuf==3.20.3
